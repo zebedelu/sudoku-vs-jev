@@ -335,7 +335,7 @@ def monospace(text, width):
 
 def draw_jev_panel(move=None, cells=None):
     print()
-    print(f"  {FG_JEV}┌─ JEV 1.13 ─────────────────────────────┐{RESET}")
+    print(f"  {FG_JEV}┌─ JEV 1.13 ──────────────────────────────┐{RESET}")
     if move is None:
         lines = cells or {}
         waiting = monospace("waiting for the next move...", 39)
@@ -364,16 +364,19 @@ def draw_jev_panel(move=None, cells=None):
             prob_bar = f"{FG_JEV}{confidence_bar(prob, 8)}{RESET}"
             name_txt = monospace(name, 8)
             prob_txt = f"{prob:>4.0%}"
+            pad = " " * (41 - (1 + 8 + 1 + 8 + 1 + 4))
             print(f"  {FG_JEV_DIM}│{RESET} {FG_JEV_DIM}{name_txt}{RESET} {prob_bar} "
-                  f"{FG_JEV_DIM}{prob_txt}{RESET}     {FG_JEV_DIM}│{RESET}")
+                  f"{FG_JEV_DIM}{prob_txt}{RESET}{pad}{FG_JEV_DIM}│{RESET}")
         if not best:
-            print(f"  {FG_JEV_DIM}│{RESET} {FG_DIM}(no probabilities){RESET}{' ' * 15}{FG_JEV_DIM}│{RESET}")
+            pad = " " * (41 - (1 + len("(no probabilities)")))
+            print(f"  {FG_JEV_DIM}│{RESET} {FG_DIM}(no probabilities){RESET}{pad}{FG_JEV_DIM}│{RESET}")
 
         cost = move.cost if move.cost is not None else jev_cost
         info = monospace(f"tok {move.input_tokens}/{move.output_tokens}", 16)
         cost_txt = monospace(f"${cost:.5f}", 11)
         lat_txt = monospace(f"{move.latency:.2f}s", 6)
-        print(f"  {FG_JEV_DIM}│{RESET} {FG_LABEL}{info}{cost_txt}{lat_txt}{RESET} {FG_JEV_DIM}│{RESET}")
+        pad = " " * (41 - (1 + 16 + 11 + 6 + 1))
+        print(f"  {FG_JEV_DIM}│{RESET} {FG_LABEL}{info}{cost_txt}{lat_txt}{RESET}{pad} {FG_JEV_DIM}│{RESET}")
         opt_txt = f"options offered: {total}"
         print(f"  {FG_JEV_DIM}│{RESET} {FG_DIM}{monospace(opt_txt, 39)}{RESET} {FG_JEV_DIM}│{RESET}")
     print(f"  {FG_JEV}└─────────────────────────────────────────┘{RESET}")
@@ -482,14 +485,12 @@ def won():
 
 
 def victory_screen():
-    clear_screen()
     elapsed = int(time.time() - start_time)
     clock = f"{elapsed // 60:02}:{elapsed % 60:02}"
-    print(f"\n{FG_OK}{'═' * 45}{RESET}")
-    print(f"{FG_OK}{'CONGRATULATIONS! YOU COMPLETED THE SUDOKU!'.center(45)}{RESET}")
-    print(f"{FG_OK}{'═' * 45}{RESET}\n")
-    print(f"  {FG_LABEL}Level:{RESET} {BOLD}{current_level}{RESET}")
-    print(f"  {FG_LABEL}Time:{RESET} {BOLD}{clock}{RESET}\n")
+    print()
+    print(f"  {FG_OK}CONGRATULATIONS! You completed the Sudoku!{RESET}")
+    print(f"  {FG_LABEL}Level:{RESET} {BOLD}{current_level}{RESET}   "
+          f"{FG_LABEL}Time:{RESET} {BOLD}{clock}{RESET}")
     print(f"  {FG_LABEL}Press any key for a new game...{RESET}")
 
 
@@ -542,6 +543,7 @@ def play(level):
                     conflicts = conflict_cells(numbers)
                     if won():
                         show_cursor()
+                        draw()
                         victory_screen()
                         read_key()
                         return "new"
@@ -722,15 +724,13 @@ def play_jev(level):
 
 
 def jev_victory_screen():
-    clear_screen()
     elapsed = int(time.time() - start_time)
     clock = f"{elapsed // 60:02}:{elapsed % 60:02}"
-    print(f"\n{FG_JEV}{'═' * 45}{RESET}")
-    print(f"{FG_JEV}{'JEV COMPLETED THE SUDOKU!'.center(45)}{RESET}")
-    print(f"{FG_JEV}{'═' * 45}{RESET}\n")
-    print(f"  {FG_LABEL}Level:{RESET} {BOLD}{current_level}{RESET}")
-    print(f"  {FG_LABEL}Time:{RESET} {BOLD}{clock}{RESET}")
-    print(f"  {FG_LABEL}Game cost:{RESET} {BOLD}${jev_cost:.5f}{RESET}\n")
+    print()
+    print(f"  {FG_JEV}Jev completed the Sudoku!{RESET}")
+    print(f"  {FG_LABEL}Level:{RESET} {BOLD}{current_level}{RESET}   "
+          f"{FG_LABEL}Time:{RESET} {BOLD}{clock}{RESET}   "
+          f"{FG_LABEL}Cost:{RESET} {BOLD}${jev_cost:.5f}{RESET}")
     print(f"  {FG_LABEL}Press any key for a new game...{RESET}")
 
 
