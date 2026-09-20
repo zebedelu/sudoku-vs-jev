@@ -34,6 +34,10 @@ FG_JEV_DIM = "\033[38;5;179m"
 BG_JEV = "\033[48;5;214m\033[30m"
 BG_JEV_DIM = "\033[48;5;94m\033[97m"
 
+# How many extra moves Jev gets to clear conflicts before the game calls it a
+# dead end. Only counts down while the board is inconsistent; resets when clean.
+RECOVERY_LIMIT = 30
+
 
 def enable_ansi():
     if os.name == "nt":
@@ -286,7 +290,9 @@ def draw(jev_mode=False):
         if jev_info:
             draw_jev_panel(move=jev_info, cells=None)
         else:
-            cells = jev_bridge.available_cells(numbers, fixed) if jev_bridge else {}
+            cells = jev_bridge.select_cells(
+                jev_bridge.available_cells(numbers, fixed)
+            ) if jev_bridge else {}
             draw_jev_panel(move=None, cells=cells)
 
     print()
@@ -344,7 +350,13 @@ def draw_jev_panel(move=None, cells=None):
         print(f"  {FG_JEV_DIM}│{RESET} {BOLD}{cells_txt}{RESET} {FG_JEV_DIM}│{RESET}")
         sample = list(lines.items())[:6]
         for (r, c), cands in sample:
-            txt = monospace(f"{'ABCDEFGHI'[c]}{r + 1}: {','.join(str(x) for x in cands)}", 39)
+            if cands == [0]:
+                shown = "erase"
+            elif len(cands) == 9:
+                shown = "any 1-9"
+            else:
+                shown = ",".join(str(x) for x in cands)
+            txt = monospace(f"{'ABCDEFGHI'[c]}{r + 1}: {shown}", 39)
             print(f"  {FG_JEV_DIM}│{RESET} {FG_JEV_DIM}{txt}{RESET} {FG_JEV_DIM}│{RESET}")
         remaining = len(lines) - len(sample)
         if remaining > 0:
@@ -417,13 +429,6 @@ def animate_move(row, col, num):
     highlight = None
 
 
-def animate_penalty(row, col):
-    for _ in range(2):
-        blink_cell(row, col, times=2)
-        time.sleep(0.05)
-    highlight = None
-
-
 def help_screen():
     clear_screen()
     print(f"\n{FG_TITLE}{' HELP '.center(45, '═')}{RESET}\n")
@@ -445,6 +450,8 @@ def help_screen():
     print()
     print(f"  {FG_JEV}Jev mode{RESET} {FG_LABEL}the model picks each move; you just watch{RESET}")
     print(f"  {BG_JEV} orange cell {RESET} {FG_LABEL}is the move chosen by Jev{RESET}")
+    print(f"  {FG_DIM}Jev may erase a cell or pick a digit that breaks the rules;{RESET}")
+    print(f"  {FG_DIM}the game marks it red and never tells Jev what went wrong.{RESET}")
     print()
     input(f"  {FG_LABEL}Press ENTER to go back...{RESET}")
 
@@ -607,10 +614,25 @@ def play_jev(level):
     highlight = None
     conflicts = conflict_cells(numbers)
 
+    seen = {jev_bridge.board_hash(numbers)}
+    last_cell = None
+    nudges = 0
+    recovery_left = None
+
     def try_move():
+        nonlocal last_cell, nudges, recovery_left
         global jev_info, jev_cost, conflicts
-        if not any(numbers[r][c] == 0 for r in range(9) for c in range(9)):
+
+        # Show every playable cell: empty cells and, when the board fills up,
+        # erasable cells too (so a full board is never a dead gate).
+        skip = {last_cell} if (last_cell and not conflicts) else None
+        playable = jev_bridge.available_cells(numbers, fixed, skip)
+        if not playable and skip:
+            skip = None
+            playable = jev_bridge.available_cells(numbers, fixed)
+        if not playable:
             return False
+
         prefix = 4
         frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
         call_start = time.time()
@@ -618,7 +640,8 @@ def play_jev(level):
 
         def call():
             result["move"] = jev_bridge.choose_move(
-                numbers, fixed, session_id="sudoku-vs-jev"
+                numbers, fixed, session_id="sudoku-vs-jev", skip=skip,
+                conflicts=conflicts,
             )
 
         import threading
@@ -627,7 +650,9 @@ def play_jev(level):
         thread.start()
         i = 0
         while thread.is_alive():
-            cells = jev_bridge.available_cells(numbers, fixed)
+            cells = jev_bridge.select_cells(
+                jev_bridge.available_cells(numbers, fixed)
+            )
             info = (
                 f"now {prefix} {frames[i % len(frames)]}  thinking...   "
                 f"cells: {len(cells)}   options: {sum(len(v) for v in cells.values())}   "
@@ -644,21 +669,49 @@ def play_jev(level):
             set_message("Jev did not return a valid move.", 3.0)
             return False
 
-        jev_info = move
-        if move.cost:
-            jev_cost += move.cost
-        animate_move(move.row, move.col, move.num)
-        r, c = move.row, move.col
-        fixed.add((r, c))
-        if (r, c) in conflicts:
-            set_message("Jev created a conflict! Undoing the move...", 3.0)
-            global highlight
-            animate_penalty(r, c)
-            numbers[r][c] = 0
-            fixed.discard((r, c))
-            conflicts = conflict_cells(numbers)
-            jev_info = None
-            return False
+        resolved = jev_bridge.resolve_cycle(numbers, move, seen)
+        if resolved is None:
+            set_message("Jev is stuck: every move repeats a position. Play paused.", 4.0)
+            return "stop"
+        if resolved is not move:
+            nudges += 1
+            set_message("Jev tried to repeat a position; nudged to another move.", 2.5)
+        else:
+            nudges = 0
+
+        jev_info = resolved
+        if resolved.cost:
+            jev_cost += resolved.cost
+        r, c = resolved.row, resolved.col
+        legal = resolved.num == 0 or is_valid(numbers, r, c, resolved.num)
+        animate_move(r, c, resolved.num)
+        seen.add(jev_bridge.board_hash(numbers))
+        last_cell = (r, c)
+        if not legal:
+            set_message("Jev made an illegal move!", 3.0)
+        if nudges >= 5:
+            set_message("Jev keeps looping; play paused.", 4.0)
+            return "stop"
+
+        if won():
+            recovery_left = None
+            return True
+        if not conflicts and jev_bridge.no_legal_moves(numbers):
+            recovery_left = None
+            set_message("Dead end: no legal move left. Play paused.", 4.0)
+            return "stop"
+        if conflicts:
+            if recovery_left is None:
+                recovery_left = RECOVERY_LIMIT
+            else:
+                recovery_left -= 1
+            if recovery_left <= 0:
+                recovery_left = None
+                set_message("Dead end: Jev could not fix the board. Play paused.", 4.0)
+                return "stop"
+            set_message(f"Jev is fixing conflicts ({recovery_left} moves left).", 2.0)
+        else:
+            recovery_left = None
         return True
 
     hide_cursor()
@@ -674,7 +727,10 @@ def play_jev(level):
             if automatic:
                 if won():
                     break
-                try_move()
+                outcome = try_move()
+                if outcome == "stop":
+                    automatic = False
+                    continue
                 if won():
                     break
                 delay = delays[delay_idx]
@@ -689,7 +745,10 @@ def play_jev(level):
             if key in ("q", "\x1b"):
                 return "quit"
             elif key in (" ", "\r", "\n"):
-                if not try_move() and won():
+                outcome = try_move()
+                if outcome == "stop":
+                    automatic = False
+                elif not outcome and won():
                     break
             elif key == "a":
                 automatic = not automatic
@@ -710,6 +769,10 @@ def play_jev(level):
                             numbers[r][c] = 0
                 conflicts = conflict_cells(numbers)
                 jev_info = None
+                seen = {jev_bridge.board_hash(numbers)}
+                last_cell = None
+                nudges = 0
+                recovery_left = None
                 set_message("Moves cleared.", 1.5)
             elif key == "h":
                 show_cursor()

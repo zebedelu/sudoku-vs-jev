@@ -13,7 +13,8 @@ playground where a model has to make one decision at a time against a state
 that pure code controls:
 
 - All the arithmetic and rule-checking (rows, columns, 3x3 boxes) stays in
-  Python. The bridge only ever offers Jev **legal** moves.
+  Python. The bridge offers every non-given cell; Jev may still choose an
+  out-of-rules digit, and the game shows the mistake without telling the model.
 - Each turn is a single, atomic question: *pick the best move from this list*.
 - The result is easy to grade: either the board gets solved or it does not.
 
@@ -36,9 +37,9 @@ It exposes three primitives, which can be mixed in one call:
 | **Score**  | Score the state on a rubric | `score`, `probabilities`, `confidence` |
 | **Noul**   | Is this statement true? | `noul` (0–1) |
 
-This project uses the **Choice** primitive: one option per legal
-`(empty cell, digit)` pair, and Jev returns the move plus a probability
-distribution over the alternatives.
+This project uses the **Choice** primitive: one option per move - a digit for
+an empty cell, or an erase for a filled one - and Jev returns the move plus a
+probability distribution over the alternatives.
 
 - OpenRouter model page: <https://openrouter.ai/typesafe/jev-1.13>
 - Official site: <https://typesafe.ai>
@@ -101,26 +102,45 @@ Then choose a difficulty (`1` Easy, `2` Medium, `3` Hard).
 | `+` / `-` | adjust the delay between automatic moves |
 | `N` / `R` / `H` / `Q` | new game / clear moves / help / quit |
 
-While Jev thinks, the panel shows the number of available cells and options,
-then the chosen move, its confidence, the top probabilities, tokens, per-move
-cost and latency. Each Jev move is added to the fixed set, so it is never
-offered again.
+While Jev thinks, the panel shows the number of offered cells and options (at
+most 255), then the chosen move, its confidence, the top probabilities, tokens,
+per-move cost and latency. Jev's own cells stay erasable; only the original
+givens are protected.
 
 ## How the Jev integration works
 
 For every turn, `jev_bridge.py`:
 
-1. Computes the candidates (legal digits) for every empty cell.
-2. Builds one `Choice` question where each option is a legal move, e.g.
-   `R4C=7`, with the cell's candidates listed for context.
+1. Lists every non-given cell: an empty cell offers digits 1-9 (legal or, on
+   purpose, illegal) and a filled cell offers an erase (`R4C=0`). The state also
+   carries the board and each cell's legal candidates, so the model can prefer
+   forced cells (naked singles).
+2. Builds one `Choice` question where each option is a move, e.g. `R4C=7`.
 3. Sends the board state plus that question to
    `POST https://openrouter.ai/api/alpha/decisions`.
-4. Validates the answer: the cell must be available and the digit must be one
-   of its candidates. Fixed cells are never offered.
+4. Applies the answer as-is. An illegal placement is kept and shown red, and no
+   error is reported back to the model. Fixed cells are never offered.
 
-The model never sees the answer key and never edits a fixed cell. `MAX_OPTIONS`
-at the top of `jev_bridge.py` caps how many options are sent; `None` sends all,
-which can exceed 700 on a nearly empty board. Lower it for cheaper, faster calls.
+Because Jev is deterministic and does not remember past turns, it could otherwise
+oscillate (`place d` / `erase d` on the same cell). Two guards prevent that: the
+cell played on the previous turn is hidden from the next call (`skip`), and if the
+chosen move would recreate a board already seen, the game nudges Jev to its
+next-best option (`resolve_cycle`). Only when every option would repeat a position
+does automatic play pause. Skip is dropped while the board has conflicts, so the
+cell to fix is always offered.
+
+Cells that break the rules are marked `conflict: true` in the state, and the
+guidance tells Jev to erase one of them; without that signal it had no reason to
+undo. A board that fills up is not the end either: `try_move` still offers the
+erasable cells, so Jev keeps trying. While conflicts remain it gets
+`RECOVERY_LIMIT` (30) extra moves before the game declares a dead end; a dead end
+with no conflicts (empty cells, no legal digit) pauses right away.
+
+The model never sees the answer key and never edits a fixed cell. A TypeSafe
+Choice accepts at most 255 options, so `MAX_OPTIONS` (default 255) caps how many
+are sent and the payload is always clamped to that limit: cells with the fewest
+options (erasable cells first) are kept, the rest are dropped for that turn and
+reconsidered on later turns. Lower it for cheaper, faster calls.
 
 ## Benchmarks
 

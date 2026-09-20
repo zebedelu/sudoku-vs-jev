@@ -1,8 +1,10 @@
 """Bridge between the Sudoku game and the Jev 1.13 (TypeSafe) decision model via OpenRouter.
 
 Jev does not generate text: it answers typed questions (noul/choice/score) about a
-state. All Sudoku logic (which digits are legal in each cell) lives here, in code;
-Jev only chooses among the legal moves we offer.
+state. The bridge offers every non-given cell as an option: an empty cell offers all
+digits 1-9 (legal or not, on purpose) and a filled non-given cell offers an erase.
+Jev's choice is applied as-is, so it can make an illegal move; showing the mistake is
+the game's job, and no error is ever reported back to the model.
 
 Use as a library:
     from jev_bridge import choose_move
@@ -63,14 +65,18 @@ def load_env(path=None):
 
 load_env()
 
-# Maximum number of options (moves) sent to Jev. None = all cells.
-# On an empty board the first move can exceed 700 options; lower it here
-# if you want cheaper/faster responses (always keeping the cells with fewest
-# candidates first).
-MAX_OPTIONS = None
+# A TypeSafe Choice question accepts at most 255 options (see
+# https://docs.typesafe.ai/primitives/choice). Above that, the model needs a
+# multi-question hierarchy, which this bridge does not build. So MAX_OPTIONS is
+# the budget we aim for and CHOICE_LIMIT is the model's hard cap: the payload is
+# always clamped to min(MAX_OPTIONS, CHOICE_LIMIT). Lower MAX_OPTIONS for
+# cheaper/faster calls; the most restricted cells (erasable cells, then empty
+# ones) go first.
+CHOICE_LIMIT = 255
+MAX_OPTIONS = CHOICE_LIMIT
 
 COLUMNS = "ABCDEFGHI"
-MOVE_PATTERN = re.compile(r"^R([1-9])([A-I])=([1-9])$")
+MOVE_PATTERN = re.compile(r"^R([1-9])([A-I])=([0-9])$")
 
 RETRYABLE_STATUS = {429, 500, 502, 503, 524, 529}
 
@@ -129,14 +135,34 @@ def compute_candidates(numbers):
     return candidates
 
 
-def available_cells(numbers, fixed=None):
-    """Empty playable cells with their candidates. Never includes fixed cells."""
+def no_legal_moves(numbers):
+    """True for a dead end: the board is not full but no empty cell has a
+    legal digit left (every candidate list is empty)."""
+    candidates = compute_candidates(numbers)
+    if not candidates:
+        return False
+    return all(not options for options in candidates.values())
+
+
+def available_cells(numbers, fixed=None, skip=None):
+    """Playable cells with the values Jev may choose for each.
+
+    Fixed (given) cells are never offered. An empty cell offers every digit 1-9,
+    including digits that break the Sudoku rules (on purpose: Jev is allowed to
+    play illegal moves). A non-empty, non-fixed cell offers only 0 (erase it).
+
+    `fixed` marks protected cells: pass just the givens when Jev's own played
+    cells must stay erasable. `skip` is a set of (row, col) cells to hide for
+    this turn, used to forbid the inverse of the previous move (anti-loop).
+    """
     fixed = fixed or set()
+    skip = skip or set()
     available = {}
-    for (r, c), cands in compute_candidates(numbers).items():
-        if (r, c) in fixed:
-            continue
-        available[(r, c)] = cands
+    for r in range(9):
+        for c in range(9):
+            if (r, c) in fixed or (r, c) in skip:
+                continue
+            available[(r, c)] = list(range(1, 10)) if numbers[r][c] == 0 else [0]
     return available
 
 
@@ -145,74 +171,111 @@ def _cell_label(r, c):
 
 
 def _sort_cells(cells):
-    # Most restricted cells (fewest candidates) first.
+    # Cells with fewest options (erasable cells, then empty ones) first.
     return sorted(cells.items(), key=lambda item: (len(item[1]), item[0][0], item[0][1]))
 
 
-def _select_cells(cells, max_options=MAX_OPTIONS):
-    if max_options is None:
-        return dict(cells)
+def select_cells(cells, max_options=MAX_OPTIONS):
+    """Keeps the cells that fit in the option budget, never exceeding the cap.
+
+    The budget can be lowered per call but is always clamped to CHOICE_LIMIT,
+    the model's hard limit of 255 options per Choice. Cells are added cheapest
+    first (erase = 1 option, empty = 9), so as many moves as possible fit.
+    """
+    budget = CHOICE_LIMIT if max_options is None else min(max_options, CHOICE_LIMIT)
     selected = {}
     total = 0
-    for (r, c), cands in _sort_cells(cells):
-        if total + len(cands) > max_options and selected:
-            break
-        selected[(r, c)] = cands
-        total += len(cands)
+    for (r, c), options in _sort_cells(cells):
+        if total + len(options) > budget:
+            continue
+        selected[(r, c)] = options
+        total += len(options)
     return selected
 
 
-def build_state(cells):
+def build_state(cells, numbers, fixed=None, conflicts=None):
     """State sent to Jev (in English: the model's primary language)."""
-    cell_list = [
-        {"cell": _cell_label(r, c), "candidates": list(cands)}
-        for (r, c), cands in _sort_cells(cells)
+    conflicts = conflicts or set()
+    legal = compute_candidates(numbers)
+    cell_list = []
+    for (r, c), options in _sort_cells(cells):
+        if options == list(range(1, 10)):
+            entry = {
+                "cell": _cell_label(r, c),
+                "status": "empty",
+                "legal_candidates": legal.get((r, c), []),
+                "placeable_digits": list(options),
+            }
+        else:
+            entry = {
+                "cell": _cell_label(r, c),
+                "status": "filled",
+                "value": numbers[r][c],
+                "action": "erase",
+            }
+            if (r, c) in conflicts:
+                entry["conflict"] = True
+        cell_list.append(entry)
+    board = [
+        "".join(str(numbers[r][c]) if numbers[r][c] else "." for c in range(9))
+        for r in range(9)
     ]
     return {
-        "task": "Choose the single best legal move for this 9x9 Sudoku puzzle.",
+        "task": (
+            "Choose the single best move for this 9x9 Sudoku puzzle. Rows are "
+            "numbered 1-9 top to bottom; columns are letters A-I left to right."
+        ),
+        "board": board,
         "notation": (
-            "Cell ids look like R1C: R + row (1-9) + column letter (A-I). "
-            "A move option looks like R1C=5, meaning put digit 5 in row 1, column C. "
-            "Only the cells listed as available are empty; every other cell is "
-            "already fixed and must not be changed. Each available cell lists the "
-            "digits that are legal for it (its candidates)."
+            "board rows are strings, '.' is an empty cell. Cell ids look like R1C: "
+            "R + row (1-9) + column letter (A-I). A move option looks like R1C=5, "
+            "meaning put digit 5 in row 1, column C, and R1C=0, meaning erase the "
+            "number in that cell. Fixed cells are not listed and must not be changed. "
+            "An empty cell lists the digits you may place; a filled cell can be erased. "
+            "A filled cell marked conflict:true repeats a digit in its row, column or "
+            "box and is wrong."
         ),
         "guidance": (
-            "Prefer a cell with few candidates, especially a cell with a single "
-            "candidate, since that placement is forced."
+            "Prefer a cell whose legal_candidates has a single digit: that placement "
+            "is forced (a naked single). If any filled cell is marked conflict:true, "
+            "erasing one of those conflicting cells is a strong move."
         ),
         "available_cells": cell_list,
     }
 
 
 def build_question(cells, max_options=MAX_OPTIONS):
-    """A single Choice question with every legal move as an option."""
-    cells = _select_cells(cells, max_options)
+    """A single Choice question with one option per offered move (<= 255)."""
+    cells = select_cells(cells, max_options)
     criteria = {}
-    for (r, c), cands in _sort_cells(cells):
-        for num in cands:
+    for (r, c), options in _sort_cells(cells):
+        for num in options:
             key = f"{_cell_label(r, c)}={num}"
-            criteria[key] = (
-                f"Put {num} in row {r + 1}, column {COLUMNS[c]} "
-                f"(this cell's candidates: {', '.join(str(x) for x in cands)})"
-            )
+            if num == 0:
+                criteria[key] = (
+                    f"Erase row {r + 1}, column {COLUMNS[c]} "
+                    f"(remove the number currently in that cell)."
+                )
+            else:
+                criteria[key] = f"Put {num} in row {r + 1}, column {COLUMNS[c]}."
     return {
         "move": {
             "type": "choice",
             "instructions": (
-                "Pick exactly one move option. Each option is a legal Sudoku move. "
-                "Choose the move a strong player would make right now."
+                "Pick exactly one move option. Choose the move a strong player "
+                "would make right now."
             ),
             "criteria": criteria,
         }
     }
 
 
-def build_payload(numbers, fixed=None, session_id=None, max_options=MAX_OPTIONS):
-    cells = available_cells(numbers, fixed)
+def build_payload(numbers, fixed=None, session_id=None, max_options=MAX_OPTIONS,
+                  skip=None, conflicts=None):
+    cells = select_cells(available_cells(numbers, fixed, skip), max_options)
     payload = {
         "model": MODEL,
-        "state": build_state(cells),
+        "state": build_state(cells, numbers, fixed, conflicts),
         "questions": build_question(cells, max_options),
     }
     if session_id:
@@ -290,7 +353,7 @@ def _validate_response(state, criteria, result):
     if candidates is None:
         raise JevError(f"Jev chose an unavailable cell: {choice!r}")
     if num not in candidates:
-        raise JevError(f"Jev chose a number that is not a candidate: {choice!r}")
+        raise JevError(f"Jev chose a number that is not offered: {choice!r}")
 
     usage = result.get("usage") or {}
     cost = usage.get("cost")
@@ -298,16 +361,26 @@ def _validate_response(state, criteria, result):
 
 
 def request_move(numbers, fixed=None, *, session_id=None, timeout=15.0,
-                 validation_attempts=2, max_options=MAX_OPTIONS):
-    """Calls Jev and returns a validated JevMove. Raises JevError on failure."""
+                 validation_attempts=2, max_options=MAX_OPTIONS, skip=None,
+                 conflicts=None):
+    """Calls Jev and returns a validated JevMove. Raises JevError on failure.
+
+    `skip` hides cells for this call (anti-loop); if it would leave no move at
+    all, the call is retried without it so the endgame never gets stuck.
+    `conflicts` marks filled cells that break the rules so Jev can choose to
+    erase them.
+    """
     key = _get_key()
-    cells = available_cells(numbers, fixed)
+    cells = select_cells(available_cells(numbers, fixed, skip), max_options)
+    if not cells and skip:
+        skip = None
+        cells = select_cells(available_cells(numbers, fixed, skip), max_options)
     if not cells:
         return None
 
     payload = {
         "model": MODEL,
-        "state": build_state(cells),
+        "state": build_state(cells, numbers, fixed, conflicts),
         "questions": build_question(cells, max_options),
     }
     if session_id:
@@ -355,6 +428,61 @@ def choose_move(numbers, fixed=None, **kwargs):
         return None
 
 
+def board_hash(board):
+    """Stable hashable snapshot of a board, for cycle detection."""
+    return tuple(tuple(row) for row in board)
+
+
+def _apply(board, row, col, num):
+    copy = [row_values[:] for row_values in board]
+    copy[row][col] = num
+    return copy
+
+
+def _parse_option(key):
+    match = MOVE_PATTERN.match(key)
+    if not match:
+        return None
+    return int(match.group(1)) - 1, COLUMNS.index(match.group(2)), int(match.group(3))
+
+
+def resolve_cycle(numbers, move, seen):
+    """Returns a move that does not recreate an already seen board.
+
+    `move` is applied to a copy: if the resulting board is new, `move` is
+    returned unchanged. If it repeats a seen board, the options are tried in
+    order of decreasing probability and the first one leading to a new board is
+    returned. Returns None when every option repeats a seen board (the caller
+    should then stop instead of looping).
+    """
+    if move is None:
+        return None
+    if board_hash(_apply(numbers, move.row, move.col, move.num)) not in seen:
+        return move
+
+    ranked = sorted(move.probabilities.items(), key=lambda item: item[1], reverse=True)
+    for key, _ in ranked:
+        parsed = _parse_option(key)
+        if parsed is None:
+            continue
+        row, col, num = parsed
+        if board_hash(_apply(numbers, row, col, num)) not in seen:
+            return JevMove(
+                row=row,
+                col=col,
+                num=num,
+                confidence=move.confidence,
+                probabilities=move.probabilities,
+                options=move.options,
+                cost=move.cost,
+                input_tokens=move.input_tokens,
+                output_tokens=move.output_tokens,
+                latency=move.latency,
+                raw=key,
+            )
+    return None
+
+
 # --------------------------------------------------------------------------
 # Diagnostics / offline tests
 # --------------------------------------------------------------------------
@@ -377,12 +505,18 @@ def _cmd_print():
     board = _example_board()
     fixed = {(r, c) for r in range(9) for c in range(9) if board[r][c] != 0}
     payload = build_payload(board, fixed, session_id="sudoku-print")
-    cells = available_cells(board, fixed)
+    available = available_cells(board, fixed)
+    offered = select_cells(available)
     print(json.dumps(payload, indent=2, ensure_ascii=False))
-    print(f"\n# available cells: {len(cells)}", file=sys.stderr)
-    print(f"# options in the Choice: {len(payload['questions']['move']['criteria'])}", file=sys.stderr)
+    options = payload["questions"]["move"]["criteria"]
+    total_available = sum(len(v) for v in available.values())
+    print(f"\n# available cells: {len(available)}", file=sys.stderr)
+    print(f"# offered cells: {len(offered)}", file=sys.stderr)
+    print(f"# options in the Choice: {len(options)} (limit {CHOICE_LIMIT})", file=sys.stderr)
+    if len(options) < total_available:
+        print(f"# truncated: {total_available} options were available", file=sys.stderr)
     fixed_offered = [
-        key for key in payload["questions"]["move"]["criteria"]
+        key for key in options
         if MOVE_PATTERN.match(key)
         and (int(MOVE_PATTERN.match(key).group(1)) - 1, COLUMNS.index(MOVE_PATTERN.match(key).group(2))) in fixed
     ]
@@ -392,26 +526,83 @@ def _cmd_print():
 def _cmd_selftest():
     board = _example_board()
     fixed = {(r, c) for r in range(9) for c in range(9) if board[r][c] != 0}
-    cells = available_cells(board, fixed)
-    assert all(board[r][c] == 0 for (r, c) in cells), "non-empty cell offered"
-    assert not (set(cells) & fixed), "fixed cell offered"
-    for (r, c), cands in cells.items():
-        for n in cands:
-            assert _is_valid(board, r, c, n), f"invalid candidate {n} at {(r, c)}"
-    assert len(cells) == sum(1 for r in range(9) for c in range(9) if board[r][c] == 0)
+    available = available_cells(board, fixed)
+    assert not (set(available) & fixed), "fixed cell offered"
+    for (r, c), options in available.items():
+        if board[r][c] == 0:
+            assert options == list(range(1, 10)), f"empty cell must offer 1-9: {(r, c)}"
+        else:
+            assert options == [0], f"filled non-fixed cell must offer erase: {(r, c)}"
 
-    question = build_question(cells)
-    for key in question["move"]["criteria"]:
+    offered = select_cells(available)
+    question = build_question(available)
+    question_options = question["move"]["criteria"]
+    for key in question_options:
         m = MOVE_PATTERN.match(key)
         assert m, f"invalid key {key}"
         r, c, n = int(m.group(1)) - 1, COLUMNS.index(m.group(2)), int(m.group(3))
-        assert n in cells[(r, c)], f"option {key} is not a candidate of the cell"
-        assert (r, c) in cells, f"option {key} points to an unavailable cell"
+        assert (r, c) in offered, f"option {key} points to a cell that was not offered"
+        assert n in offered[(r, c)], f"option {key} is not offered for the cell"
+
+    assert len(question_options) <= CHOICE_LIMIT, "exceeded the 255-option limit"
+    expected = sum(len(options) for options in offered.values())
+    assert len(question_options) == expected, "missing or extra options"
+    assert len(offered) <= len(available), "offered more cells than available"
+
+    # The hard cap must hold even if a caller asks for more options.
+    assert len(build_question(available, 100000)["move"]["criteria"]) <= CHOICE_LIMIT
 
     payload = build_payload(board, fixed)
     assert payload["model"] == MODEL
     assert payload["state"]["available_cells"]
-    print("selftest OK: cells, candidates and options consistent.")
+    assert len(payload["state"]["available_cells"]) == len(offered), "state/question mismatch"
+
+    # skip hides a cell for one call
+    target = next(iter(available))
+    assert target not in available_cells(board, fixed, skip={target})
+    assert target in available_cells(board, fixed)
+
+    # the state carries the board and the legal candidates
+    state = build_state(select_cells(available), board, fixed)
+    assert len(state["board"]) == 9, "board missing from state"
+    assert any("legal_candidates" in entry for entry in state["available_cells"])
+
+    # resolve_cycle keeps a fresh move and nudges away from a repeated board
+    r, c = 0, 2
+    assert board[r][c] == 0
+    place = JevMove(row=r, col=c, num=1, probabilities={"R1C=1": 1.0})
+    assert resolve_cycle(board, place, set()) is place
+    after = _apply(board, r, c, 1)
+    seen = {board_hash(board), board_hash(after)}
+    erase = JevMove(row=r, col=c, num=0, probabilities={"R1C=0": 0.9, "R1D=1": 0.1})
+    nudged = resolve_cycle(after, erase, seen)
+    assert nudged is not None and nudged.raw != "R1C=0", "cycle was not nudged"
+    assert board_hash(_apply(after, nudged.row, nudged.col, nudged.num)) not in seen
+    stuck = JevMove(row=r, col=c, num=0, probabilities={"R1C=0": 1.0})
+    assert resolve_cycle(after, stuck, seen) is None, "should report a dead end"
+
+    # a filled cell in conflict is marked so Jev knows it can erase it
+    cboard = [row[:] for row in board]
+    cboard[r][c] = 1
+    entries = {
+        entry["cell"]: entry
+        for entry in build_state(select_cells(available_cells(cboard, fixed)),
+                                 cboard, fixed, conflicts={(r, c)})["available_cells"]
+    }
+    assert entries["R1C"].get("conflict") is True, "conflict not marked"
+    clean = {
+        entry["cell"]: entry
+        for entry in build_state(select_cells(available_cells(cboard, fixed)),
+                                 cboard, fixed, conflicts=set())["available_cells"]
+    }
+    assert "conflict" not in clean["R1C"], "conflict marked without a conflict"
+
+    # dead-end detection: no empty cell has any legal digit
+    assert no_legal_moves(board) is False
+    dead = [[0, 1, 2, 3, 4, 5, 6, 7, 8]] + [[9] * 9 for _ in range(8)]
+    assert no_legal_moves(dead) is True
+
+    print("selftest OK: options within the limit, state context, conflicts and anti-cycle work.")
 
 
 def _cmd_debug():
